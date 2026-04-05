@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+env/
+.venv/
+
+# Bot state and logs
+bot_state.json
+bot.log
+*.log
+*.jsonl
+TRADE_LOG.md
+trainer/reports/
+trainer/training_state.json
+trainer/meta_state.json
+trainer/meta_outcomes.json
+trainer/meta_overrides.json
+trainer/param_overrides.json
+trainer/signal_history.json
+manager/last_health.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
