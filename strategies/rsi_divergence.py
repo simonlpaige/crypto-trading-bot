@@ -41,13 +41,38 @@ def find_swing_highs(prices: list, window: int = 5) -> list:
 
 
 def rsi_series(prices: list, period: int = 14) -> list:
-    """Calculate RSI for each point in the series (returns aligned to prices)."""
+    """Calculate RSI for each point in the series using Wilder's SMMA.
+
+    Returns a list aligned to prices (None for the first period+1 entries
+    where RSI can't be computed, then a float for each subsequent bar).
+    Uses a running Wilder smooth so results are consistent with calc_rsi().
+    """
     if len(prices) < period + 1:
         return []
-    result = [None] * (period + 1)
-    for i in range(period + 1, len(prices) + 1):
-        r = calc_rsi(prices[:i], period)
-        result.append(r)
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    result: list = [None] * (period + 1)  # RSI undefined for first period+1 bars
+
+    # Seed with SMA of first `period` deltas
+    avg_gain = sum(max(d, 0) for d in deltas[:period]) / period
+    avg_loss = sum(max(-d, 0) for d in deltas[:period]) / period
+
+    # First computable RSI
+    if avg_loss == 0:
+        result.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        result.append(100 - (100 / (1 + rs)))
+
+    # Wilder's smoothing for subsequent bars
+    for d in deltas[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
+        if avg_loss == 0:
+            result.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            result.append(100 - (100 / (1 + rs)))
+
     return result
 
 
