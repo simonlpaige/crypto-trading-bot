@@ -30,15 +30,32 @@ def ema(prices: list, period: int) -> list:
 
 
 def calc_rsi(prices: list, period: int = 14) -> Optional[float]:
-    """Calculate RSI from closing prices."""
+    """Calculate RSI using Wilder's smoothed moving average (SMMA).
+
+    This matches the standard RSI shown on TradingView, Binance, and most
+    charting platforms. The first average is a simple mean (SMA seed),
+    then subsequent values use exponential smoothing:
+        avg = (prev_avg * (period - 1) + current_value) / period
+
+    See: https://www.investopedia.com/terms/r/rsi.asp
+    """
     if len(prices) < period + 1:
         return None
     deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    recent = deltas[-period:]
-    gains = [d for d in recent if d > 0]
-    losses = [-d for d in recent if d < 0]
-    avg_gain = sum(gains) / period if gains else 0.001
-    avg_loss = sum(losses) / period if losses else 0.001
+
+    # Seed with SMA of first `period` deltas
+    first_gains = [max(d, 0) for d in deltas[:period]]
+    first_losses = [max(-d, 0) for d in deltas[:period]]
+    avg_gain = sum(first_gains) / period
+    avg_loss = sum(first_losses) / period
+
+    # Wilder's smoothing for the remaining deltas
+    for d in deltas[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
+
+    if avg_loss == 0:
+        return 100.0  # no losses → RSI maxes out
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -115,16 +132,19 @@ class EmaMacdMomentum:
         if not ema12 or not ema26:
             return actions
 
-        # Align EMAs (ema26 starts later)
+        # Align EMAs — ema26 produces fewer values than ema12 because it
+        # needs 26 bars of seed data vs 12. Trim ema12 to match ema26 length.
         offset = len(ema12) - len(ema26)
         ema12_aligned = ema12[offset:]
 
-        # MACD line and histogram
+        # MACD = EMA12 - EMA26; Signal = 9-period EMA of MACD line
+        # Histogram = MACD - Signal (positive = bullish momentum)
         macd_line = [e12 - e26 for e12, e26 in zip(ema12_aligned, ema26)]
         signal_line = ema(macd_line, 9) if len(macd_line) >= 9 else []
         if not signal_line:
             return actions
 
+        # Align MACD and signal line (signal starts later due to 9-bar EMA)
         sl_offset = len(macd_line) - len(signal_line)
         macd_hist = [m - s for m, s in zip(macd_line[sl_offset:], signal_line)]
 
