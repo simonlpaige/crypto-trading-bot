@@ -79,11 +79,20 @@ def log_trade_to_md(position: dict):
 
 
 def log_daily_summary(summary: dict):
-    """Append daily summary to TRADE_LOG.md."""
+    """Append daily summary to TRADE_LOG.md. Skips if already written for this date."""
     path = config.TRADE_LOG_PATH
+    date_marker = f"### Daily Summary — {summary['date']}"
+
+    # Check for duplicate: don't write if this date's summary already exists
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            if date_marker in f.read():
+                logger.debug("Daily summary for %s already written — skipping", summary["date"])
+                return
+
     lines = [
         "",
-        f"### Daily Summary — {summary['date']}",
+        date_marker,
         f"- **Balance:** ${summary['balance']:,.2f}",
         f"- **Daily P&L:** ${summary['daily_pnl']:+,.2f}",
         f"- **Trades opened:** {summary['trades_opened']}",

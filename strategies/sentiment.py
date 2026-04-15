@@ -13,13 +13,15 @@ from typing import Optional
 import config
 from utils.risk_manager import RiskManager
 from utils.kraken_client import KrakenClient
-from utils.logger import log_trade_to_md
-
+from trainer.param_loader import fear_threshold, greed_threshold, sentiment_tp, sentiment_sl
 logger = logging.getLogger("cryptobot.sentiment")
 
 
 class SentimentSwing:
     """Paper-trading sentiment swing strategy."""
+
+    # Fear & Greed updates once daily — only evaluate every 12 hours (72 ticks at 5min)
+    EVAL_INTERVAL_TICKS = 72
 
     def __init__(self, kraken: KrakenClient, risk: RiskManager):
         self.kraken = kraken
@@ -28,6 +30,8 @@ class SentimentSwing:
         self._prev_fng: Optional[dict] = None
         self._last_fetch = 0.0
         self._fetch_interval = 3600  # fetch FNG at most once per hour
+        self._tick_count = 0
+        self._last_eval_tick = -self.EVAL_INTERVAL_TICKS  # allow first tick to evaluate
 
     def _fetch_fear_greed(self) -> Optional[dict]:
         """Fetch current Fear & Greed Index."""
@@ -71,24 +75,58 @@ class SentimentSwing:
         if not ticker:
             return False
         low_24h = ticker["low_24h"]
-        # Price is >1% above 24h low = potential positive divergence
-        return current_price > low_24h * 1.01
+        # Price is >0.5% above 24h low = potential positive divergence
+        return current_price > low_24h * 1.005
 
     def evaluate(self, current_price: float) -> list:
-        """Evaluate sentiment signals and manage positions."""
+        """Evaluate sentiment signals and manage positions.
+        Only checks for new entries every 72 ticks (~12h) since Fear & Greed updates daily.
+        Exit checks still run every tick for open positions.
+        """
         actions = []
+        self._tick_count += 1
 
         fng = self._fetch_fear_greed()
         if not fng:
             return actions
+
+        # Always check exits on open positions (every tick)
+        for pos in list(self.risk.positions):
+            if pos["status"] != "open" or pos["strategy"] != "sentiment":
+                continue
+            # Time-based exit: close after 7 days max
+            opened = datetime.fromisoformat(pos["opened_at"])
+            if datetime.utcnow() - opened > timedelta(days=7):
+                logger.info("Sentiment position %s held 7 days — closing", pos["id"])
+                result = self.risk.close_position(pos["id"], current_price)
+                if result:
+                    actions.append(result)
+                continue
+            # Sentiment-based exit: close longs on extreme greed, close shorts on extreme fear
+            if pos["side"] == "buy" and fng["value"] >= greed_threshold():
+                logger.info("Extreme greed (%d) — closing long sentiment position", fng["value"])
+                result = self.risk.close_position(pos["id"], current_price)
+                if result:
+                    actions.append(result)
+            elif pos["side"] == "sell" and fng["value"] <= fear_threshold():
+                logger.info("Extreme fear (%d) — closing short sentiment position", fng["value"])
+                result = self.risk.close_position(pos["id"], current_price)
+                if result:
+                    actions.append(result)
+
+        # Throttle entry checks: only every EVAL_INTERVAL_TICKS ticks (~12h)
+        if (self._tick_count - self._last_eval_tick) < self.EVAL_INTERVAL_TICKS:
+            return actions
+        self._last_eval_tick = self._tick_count
+        logger.info("Sentiment entry check (tick %d, every %d ticks)", self._tick_count, self.EVAL_INTERVAL_TICKS)
 
         # ── Check for entry signals ──────────────────────────────────────
         has_open = any(p["status"] == "open" and p["strategy"] == "sentiment"
                        for p in self.risk.positions)
 
         if not has_open:
-            # BUY signal: extreme fear + positive divergence
-            if fng["value"] <= config.FEAR_THRESHOLD:
+            # BUY signal: extreme fear + positive divergence (tunable)
+            if fng["value"] <= fear_threshold():
                 if self._has_positive_divergence(current_price):
                     action = self._open_long(current_price)
                     if action:
@@ -96,8 +134,8 @@ class SentimentSwing:
                 else:
                     logger.info("Extreme fear (%d) but no positive divergence — waiting",
                                 fng["value"])
-            # SHORT signal: extreme greed + negative divergence
-            elif fng["value"] >= config.GREED_THRESHOLD:
+            # SHORT signal: extreme greed + negative divergence (tunable)
+            elif fng["value"] >= greed_threshold():
                 if self._has_negative_divergence(current_price):
                     action = self._open_short(current_price)
                     if action:
@@ -105,35 +143,6 @@ class SentimentSwing:
                 else:
                     logger.info("Extreme greed (%d) but no negative divergence — waiting",
                                 fng["value"])
-
-        # ── Check for exit signals on open sentiment positions ───────────
-        for pos in list(self.risk.positions):
-            if pos["status"] != "open" or pos["strategy"] != "sentiment":
-                continue
-
-            # Time-based exit: close after 7 days max
-            opened = datetime.fromisoformat(pos["opened_at"])
-            if datetime.utcnow() - opened > timedelta(days=7):
-                logger.info("Sentiment position %s held 7 days — closing", pos["id"])
-                result = self.risk.close_position(pos["id"], current_price)
-                if result:
-                    log_trade_to_md(result)
-                    actions.append(result)
-                continue
-
-            # Sentiment-based exit: close longs on extreme greed, close shorts on extreme fear
-            if pos["side"] == "buy" and fng["value"] >= config.GREED_THRESHOLD:
-                logger.info("Extreme greed (%d) — closing long sentiment position", fng["value"])
-                result = self.risk.close_position(pos["id"], current_price)
-                if result:
-                    log_trade_to_md(result)
-                    actions.append(result)
-            elif pos["side"] == "sell" and fng["value"] <= config.FEAR_THRESHOLD:
-                logger.info("Extreme fear (%d) — closing short sentiment position", fng["value"])
-                result = self.risk.close_position(pos["id"], current_price)
-                if result:
-                    log_trade_to_md(result)
-                    actions.append(result)
 
         return actions
 
@@ -146,19 +155,21 @@ class SentimentSwing:
         if not ticker:
             return False
         high_24h = ticker["high_24h"]
-        # Price is >1% below 24h high = potential negative divergence
-        return current_price < high_24h * 0.99
+        # Price is >0.5% below 24h high = potential negative divergence
+        return current_price < high_24h * 0.995
 
     def _open_long(self, price: float) -> Optional[dict]:
         """Open a sentiment-driven long position."""
-        can_open, reason = self.risk.can_open_position(price)
+        can_open, reason = self.risk.can_open_position(price, side="buy", strategy="sentiment")
         if not can_open:
             logger.info("Sentiment buy blocked: %s", reason)
             return None
 
         size_btc = self.risk.position_size_btc(price)
-        stop_loss = price * (1 - config.SWING_STOP_LOSS_PCT / 100)
-        take_profit = price * (1 + config.SWING_TAKE_PROFIT_PCT / 100)
+        sl_pct = sentiment_sl()
+        tp_pct = sentiment_tp()
+        stop_loss = price * (1 - sl_pct / 100)
+        take_profit = price * (1 + tp_pct / 100)
 
         pos = self.risk.open_position(
             side="buy",
@@ -168,21 +179,22 @@ class SentimentSwing:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         logger.info("Sentiment BUY: FNG=%d, price=$%.2f, size=%.6f BTC",
                      self._last_fng["value"], price, size_btc)
         return pos
 
     def _open_short(self, price: float) -> Optional[dict]:
         """Open a sentiment-driven short position (paper only)."""
-        can_open, reason = self.risk.can_open_position(price)
+        can_open, reason = self.risk.can_open_position(price, side="sell", strategy="sentiment")
         if not can_open:
             logger.info("Sentiment short blocked: %s", reason)
             return None
 
         size_btc = self.risk.position_size_btc(price)
-        stop_loss = price * (1 + config.SWING_STOP_LOSS_PCT / 100)   # SL above entry
-        take_profit = price * (1 - config.SWING_TAKE_PROFIT_PCT / 100)  # TP below entry
+        sl_pct = sentiment_sl()
+        tp_pct = sentiment_tp()
+        stop_loss = price * (1 + sl_pct / 100)   # SL above entry
+        take_profit = price * (1 - tp_pct / 100)  # TP below entry
 
         pos = self.risk.open_position(
             side="sell",
@@ -192,7 +204,6 @@ class SentimentSwing:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         logger.info("Sentiment SHORT: FNG=%d, price=$%.2f, size=%.6f BTC",
                      self._last_fng["value"], price, size_btc)
         return pos

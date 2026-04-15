@@ -17,6 +17,8 @@ import requests
 from typing import Optional, Dict
 from datetime import datetime
 
+import config
+
 logger = logging.getLogger("cryptobot.trainer.researcher")
 
 
@@ -260,8 +262,8 @@ def build_market_context(ohlc_data: Optional[list] = None) -> dict:
         "timestamp": datetime.utcnow().isoformat(),
         "fear_greed": fetch_fear_greed(),
         "volatility": detect_volatility_regime(ohlc_data) if ohlc_data else None,
-        "funding_rate": fetch_funding_rate(),
-        "derivatives_sentiment": fetch_derivatives_sentiment(),
+        "funding_rate": fetch_funding_rate() if getattr(config, 'ENABLE_BINANCE_RESEARCH', True) else None,
+        "derivatives_sentiment": fetch_derivatives_sentiment() if getattr(config, 'ENABLE_BINANCE_RESEARCH', True) else None,
     }
 
     # Derive regime recommendation

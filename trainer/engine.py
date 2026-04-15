@@ -230,11 +230,13 @@ def simulate_backtest_trades(ohlc: list, strategies: list) -> list:
     return synthetic
 
 
-def inject_simulated_trades(analysis: dict, ohlc: list) -> dict:
-    """Inject synthetic trades into analysis for strategies with no data.
-    
-    Patches the analysis dict in-place so generate_adjustments() has
-    something to work with even before real trades close.
+def inject_backtest_results(analysis: dict) -> dict:
+    """Replace synthetic simulation with real backtest results for strategies
+    with no closed-trade data.
+
+    Runs the actual backtester against cached historical data (fast if cache
+    exists, ~30s otherwise). Uses backtest win_rate, Sharpe, and profit_factor
+    as the evaluation signal for the trainer.
     """
     no_data_strats = [
         name for name, strat_analysis in analysis.get("strategies", {}).items()
@@ -242,62 +244,99 @@ def inject_simulated_trades(analysis: dict, ohlc: list) -> dict:
     ]
 
     if not no_data_strats:
-        return analysis  # Nothing to do
-
-    logger.info("No closed trades for: %s — running simulated backtest", no_data_strats)
-    sim_trades = simulate_backtest_trades(ohlc, no_data_strats)
-
-    if not sim_trades:
         return analysis
 
-    # Rebuild per-strategy analysis from simulated trades
-    from trainer.analyzer import analyze_strategy as _analyze
+    logger.info("No closed trades for: %s — running real backtests", no_data_strats)
+
+    # Check for cached backtest results (run full backtest at most once per 6 hours)
+    cache_path = os.path.join(config.BOT_DIR, "trainer", "backtest_cache.json")
+    cache_valid = False
+    cached = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached = json.load(f)
+            cached_at = datetime.fromisoformat(cached.get("cached_at", "2000-01-01"))
+            if (datetime.utcnow() - cached_at).total_seconds() < 21600:  # 6 hours
+                cache_valid = True
+                logger.info("Using cached backtest results (age: %.1fh)",
+                            (datetime.utcnow() - cached_at).total_seconds() / 3600)
+        except Exception:
+            pass
+
+    if not cache_valid:
+        try:
+            from trainer.backtester import fetch_historical_data, run_strategy_backtest
+            candles = fetch_historical_data(months=3)  # 3 months for speed
+            if candles and len(candles) > 100:
+                all_results = {}
+                for strat in ["grid", "sentiment", "ema_macd", "bollinger",
+                              "rsi_divergence", "congress_frontrun"]:
+                    try:
+                        result = run_strategy_backtest(strat, candles)
+                        all_results[strat] = result
+                        logger.info("Backtest %s: %d trades, %.1f%% WR, PF=%.2f, Sharpe=%.2f",
+                                    strat, result["total_trades"], result["win_rate"],
+                                    result["profit_factor"], result["sharpe_ratio"])
+                    except Exception as e:
+                        logger.warning("Backtest %s failed: %s", strat, e)
+
+                cached = {"cached_at": datetime.utcnow().isoformat(), "results": all_results}
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump(cached, f, indent=2)
+            else:
+                logger.warning("Insufficient historical data for backtests (%d candles)",
+                               len(candles) if candles else 0)
+                return analysis
+        except Exception as e:
+            logger.error("Backtest run failed: %s", e)
+            return analysis
+
+    # Inject backtest results into analysis
+    bt_results = cached.get("results", {})
     for strat in no_data_strats:
-        strat_sims = [t for t in sim_trades if t["strategy"] == strat]
-        if not strat_sims:
+        bt = bt_results.get(strat)
+        if not bt or bt.get("total_trades", 0) == 0:
             continue
 
-        wins = [t for t in strat_sims if t["pnl"] > 0]
-        losses = [t for t in strat_sims if t["pnl"] <= 0]
-        total_pnl = sum(t["pnl"] for t in strat_sims)
-        win_rate = len(wins) / len(strat_sims) * 100 if strat_sims else 0
-        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
-        risk_reward = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
-
         issues = []
-        if win_rate < 50:
-            issues.append(f"low_win_rate:{win_rate:.0f}%")
-        if 0 < risk_reward < 1.3:
-            issues.append(f"bad_risk_reward:{risk_reward:.2f}")
+        if bt["win_rate"] < 50:
+            issues.append(f"low_win_rate:{bt['win_rate']:.0f}%")
+        pf = bt.get("profit_factor", 0)
+        if 0 < pf < 1.3:
+            issues.append(f"bad_risk_reward:{pf:.2f}")
+        if bt.get("max_drawdown_pct", 0) > 10:
+            issues.append("excessive_drawdown")
 
         analysis["strategies"][strat] = {
             "strategy": strat,
-            "trade_count": len(strat_sims),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(win_rate, 1),
-            "total_pnl": round(total_pnl, 4),
-            "avg_win": round(avg_win, 4),
-            "avg_loss": round(avg_loss, 4),
-            "risk_reward": round(risk_reward, 2) if risk_reward != float("inf") else 99.0,
-            "max_drawdown": 0.0,
-            "avg_hold_hours": 0.1,
+            "trade_count": bt["total_trades"],
+            "wins": bt.get("wins", 0),
+            "losses": bt.get("losses", 0),
+            "win_rate": bt["win_rate"],
+            "total_pnl": bt.get("total_pnl", 0),
+            "avg_win": round(bt.get("gross_profit", 0) / max(bt.get("wins", 1), 1), 4),
+            "avg_loss": round(-bt.get("gross_loss", 0) / max(bt.get("losses", 1), 1), 4),
+            "risk_reward": bt.get("profit_factor", 0),
+            "max_drawdown": bt.get("max_drawdown_pct", 0),
+            "avg_hold_hours": bt.get("avg_hold_time_hours", 0),
             "sl_hits": 0,
             "tp_hits": 0,
             "long_win_rate": 0.0,
             "short_win_rate": 0.0,
             "issues": issues,
-            "status": "simulated" if not issues else "simulated_needs_improvement",
-            "note": "Synthetic backtest — no real trades closed yet",
+            "status": "backtest" if not issues else "backtest_needs_improvement",
+            "note": f"From real backtest: {bt['total_trades']} trades, Sharpe={bt.get('sharpe_ratio', 0):.2f}",
         }
-        # Update totals
-        analysis["total_trades"] = sum(
-            s.get("trade_count", 0) for s in analysis["strategies"].values()
-        )
-        analysis["total_pnl"] = round(sum(
-            s.get("total_pnl", 0) for s in analysis["strategies"].values()
-        ), 4)
+
+    # Update totals
+    analysis["total_trades"] = sum(
+        s.get("trade_count", 0) for s in analysis["strategies"].values()
+    )
+    analysis["total_pnl"] = round(sum(
+        s.get("total_pnl", 0) for s in analysis["strategies"].values()
+    ), 4)
 
     return analysis
 
@@ -335,15 +374,15 @@ def run_cycle(kraken: KrakenClient, training_state: dict) -> dict:
     logger.info("Step 2: Fetching market context...")
     ohlc = kraken.get_ohlc(interval=60, count=100)
 
-    # Inject simulated trades when no real ones have closed yet
-    if analysis["total_trades"] == 0 and ohlc:
-        logger.info("No closed trades yet — injecting simulated backtest data")
-        analysis = inject_simulated_trades(analysis, ohlc)
+    # Inject real backtest results when no live trades have closed yet
+    if analysis["total_trades"] == 0:
+        logger.info("No closed trades yet — injecting real backtest results")
+        analysis = inject_backtest_results(analysis)
         report["analysis"] = analysis
-        report["simulation_used"] = True
-        logger.info("  After simulation: %d synthetic trades", analysis["total_trades"])
+        report["backtest_used"] = True
+        logger.info("  After backtest injection: %d trades from backtests", analysis["total_trades"])
     else:
-        report["simulation_used"] = False
+        report["backtest_used"] = False
 
     market_context = build_market_context(ohlc)
     report["market_context"] = market_context
@@ -389,7 +428,7 @@ def run_cycle(kraken: KrakenClient, training_state: dict) -> dict:
     if cycle_num % 6 == 0:  # every 6th cycle (~6 hours at 60-min intervals)
         logger.info("Step 5: Running correlation discovery...")
         try:
-            from trainer.discovery import scan_correlations, mine_patterns, propose_strategy, get_discovery_summary
+            from trainer.discovery import scan_correlations, mine_patterns, propose_strategy, get_discovery_summary, validate_proposals
 
             correlations = scan_correlations()
             patterns = mine_patterns()
@@ -411,11 +450,18 @@ def run_cycle(kraken: KrakenClient, training_state: dict) -> dict:
                         if proposal:
                             logger.info("  Strategy proposed: %s", proposal["name"])
 
+            # Auto-promote qualifying proposals from 'proposed' → 'testing'
+            promoted = validate_proposals(min_confidence="medium", max_promote=2)
+            if promoted:
+                report["promoted_proposals"] = promoted
+                logger.info("  Promoted %d proposals to testing: %s", len(promoted), promoted)
+
             summary = get_discovery_summary()
             report["discovery_summary"] = summary
-            logger.info("  Discovery: %d history entries, %d total proposals",
+            logger.info("  Discovery: %d history entries, %d total proposals (%s)",
                         summary.get("signal_history_entries", 0),
-                        summary.get("total_proposals", 0))
+                        summary.get("total_proposals", 0),
+                        summary.get("proposals_by_status", {}))
         except Exception as disc_err:
             logger.error("Discovery step failed: %s", disc_err)
 
@@ -452,6 +498,34 @@ def run_cycle(kraken: KrakenClient, training_state: dict) -> dict:
             logger.debug("Step 6: meta-learning outcome recorded (meta-cycle every 12th)")
     except Exception as me:
         logger.error("Meta-learning failed: %s", me)
+
+    # ── Step 7: AUTO-LEARNING (failure pattern encoding) ─────────────
+    try:
+        # Track API failure patterns for diagnosis
+        if hasattr(kraken, 'get_failure_summary'):
+            failure_summary = kraken.get_failure_summary()
+            if failure_summary.get('consecutive_failures', 0) > 0:
+                report['api_failures'] = failure_summary
+                logger.warning("API failure summary: %s", failure_summary)
+
+        # Detect strategies with 0 trades over extended period
+        zero_trade_strategies = []
+        for strat_name, strat_data in analysis.get('strategies', {}).items():
+            if strat_data.get('trade_count', 0) == 0 and strat_data.get('status') == 'no_data':
+                zero_trade_strategies.append(strat_name)
+        if zero_trade_strategies and cycle_num > 12:  # after first 12 hours
+            report['auto_learn'] = report.get('auto_learn', [])
+            report['auto_learn'].append({
+                'type': 'zero_trade_strategies',
+                'strategies': zero_trade_strategies,
+                'cycles_elapsed': cycle_num,
+                'note': 'These strategies have produced 0 trades. '
+                        'Check if conditions are unreachable in current market regime.'
+            })
+            logger.warning("[auto-learn] Zero-trade strategies after %d cycles: %s",
+                          cycle_num, zero_trade_strategies)
+    except Exception as al_err:
+        logger.error("Auto-learning step failed: %s", al_err)
 
     logger.info("Cycle #%d complete. Adjustments: %d | Balance: $%.2f",
                 cycle_num, report["adjustments"].get("total", 0), analysis["balance"])

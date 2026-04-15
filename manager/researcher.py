@@ -492,9 +492,9 @@ def run_full_research(ohlc: list = None) -> dict:
     modules = {
         "fng_patterns": research_fng_patterns(),
         "volatility": research_volatility_transitions(ohlc) if ohlc else None,
-        "funding_rates": research_funding_rates(),
-        "open_interest": research_open_interest(),
-        "long_short_ratio": research_long_short_ratio(),
+        "funding_rates": research_funding_rates() if getattr(config, 'ENABLE_BINANCE_RESEARCH', True) else None,
+        "open_interest": research_open_interest() if getattr(config, 'ENABLE_BINANCE_RESEARCH', True) else None,
+        "long_short_ratio": research_long_short_ratio() if getattr(config, 'ENABLE_BINANCE_RESEARCH', True) else None,
         "cross_market": research_cross_market(ohlc) if ohlc else None,
     }
 

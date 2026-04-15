@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 import config
 from utils.risk_manager import RiskManager
 from utils.kraken_client import KrakenClient
-from utils.logger import log_trade_to_md
 from strategies.ema_macd import calc_rsi, calc_adx
+from trainer.param_loader import bb_period, bb_std, bb_rsi_oversold, bb_rsi_overbought, bb_adx_max
 
 logger = logging.getLogger("cryptobot.bollinger")
 
@@ -44,7 +44,7 @@ class BollingerMeanReversion:
     def __init__(self, kraken: KrakenClient, risk: RiskManager):
         self.kraken = kraken
         self.risk = risk
-        self._cooldown_minutes = 120  # don't re-enter within 2h
+        self._cooldown_minutes = 60  # don't re-enter within 1h
         self._last_entry_time = None
 
     def evaluate(self, current_price: float) -> list:
@@ -59,16 +59,17 @@ class BollingerMeanReversion:
         highs = [c["high"] for c in ohlc]
         lows = [c["low"] for c in ohlc]
 
-        bb = calc_bollinger(closes)
+        bb = calc_bollinger(closes, period=bb_period(), num_std=bb_std())
         if not bb:
             return actions
 
         rsi = calc_rsi(closes)
         adx = calc_adx(highs, lows, closes)
 
-        # ADX filter — only trade ranging markets (ADX < 30)
-        if adx is not None and adx >= 30:
-            logger.debug("ADX=%.1f >= 30, skipping Bollinger (trending market)", adx)
+        # ADX filter — only trade ranging markets (tunable)
+        adx_max = bb_adx_max()
+        if adx is not None and adx >= adx_max:
+            logger.debug("ADX=%.1f >= %.0f, skipping Bollinger (trending market)", adx, adx_max)
             return actions
 
         # Cooldown check
@@ -84,14 +85,12 @@ class BollingerMeanReversion:
                 logger.info("Bollinger long hit middle band ($%.2f) — closing", bb["middle"])
                 result = self.risk.close_position(pos["id"], current_price)
                 if result:
-                    log_trade_to_md(result)
                     actions.append(result)
             # Shorts: take profit at middle band
             elif pos["side"] == "sell" and current_price <= bb["middle"]:
                 logger.info("Bollinger short hit middle band ($%.2f) — closing", bb["middle"])
                 result = self.risk.close_position(pos["id"], current_price)
                 if result:
-                    log_trade_to_md(result)
                     actions.append(result)
 
         has_open = any(p["status"] == "open" and p["strategy"] == "bollinger"
@@ -100,14 +99,29 @@ class BollingerMeanReversion:
             return actions
 
         # ── Entry signals ────────────────────────────────────────────────
-        # LONG: price below lower band + RSI oversold
-        if current_price <= bb["lower"] and rsi is not None and rsi < 30:
+        # Alternative entry: if price is >1.5 std devs outside the band, enter regardless of RSI
+        extreme_lower = bb["lower"] - 1.5 * bb["std"]
+        extreme_upper = bb["upper"] + 1.5 * bb["std"]
+        rsi_os = bb_rsi_oversold() + 5   # relaxed: e.g. 30 → 35
+        rsi_ob = bb_rsi_overbought() - 5  # relaxed: e.g. 70 → 65
+
+        if current_price <= extreme_lower:
+            # Extreme dip — enter long regardless of RSI
+            action = self._open_position("buy", current_price, bb, rsi or 30)
+            if action:
+                actions.append(action)
+        elif current_price >= extreme_upper:
+            # Extreme spike — enter short regardless of RSI
+            action = self._open_position("sell", current_price, bb, rsi or 70)
+            if action:
+                actions.append(action)
+        # LONG: price below lower band + RSI oversold (tunable)
+        elif current_price <= bb["lower"] and rsi is not None and rsi < rsi_os:
             action = self._open_position("buy", current_price, bb, rsi)
             if action:
                 actions.append(action)
-
-        # SHORT: price above upper band + RSI overbought
-        elif current_price >= bb["upper"] and rsi is not None and rsi > 70:
+        # SHORT: price above upper band + RSI overbought (tunable)
+        elif current_price >= bb["upper"] and rsi is not None and rsi > rsi_ob:
             action = self._open_position("sell", current_price, bb, rsi)
             if action:
                 actions.append(action)
@@ -115,7 +129,7 @@ class BollingerMeanReversion:
         return actions
 
     def _open_position(self, side: str, price: float, bb: dict, rsi: float) -> Optional[dict]:
-        can_open, reason = self.risk.can_open_position(price)
+        can_open, reason = self.risk.can_open_position(price, side=side, strategy="bollinger")
         if not can_open:
             logger.info("Bollinger %s blocked: %s", side, reason)
             return None
@@ -136,7 +150,6 @@ class BollingerMeanReversion:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         self._last_entry_time = datetime.utcnow()
         logger.info("Bollinger %s: price=$%.2f, lower=$%.2f, upper=$%.2f, RSI=%.1f",
                      side.upper(), price, bb["lower"], bb["upper"], rsi)

@@ -14,8 +14,8 @@ from datetime import datetime, timedelta
 import config
 from utils.risk_manager import RiskManager
 from utils.kraken_client import KrakenClient
-from utils.logger import log_trade_to_md
 from strategies.ema_macd import calc_rsi
+from trainer.param_loader import rsi_div_long_threshold, rsi_div_short_threshold, rsi_div_sl, rsi_div_tp
 
 logger = logging.getLogger("cryptobot.rsi_div")
 
@@ -41,38 +41,13 @@ def find_swing_highs(prices: list, window: int = 5) -> list:
 
 
 def rsi_series(prices: list, period: int = 14) -> list:
-    """Calculate RSI for each point in the series using Wilder's SMMA.
-
-    Returns a list aligned to prices (None for the first period+1 entries
-    where RSI can't be computed, then a float for each subsequent bar).
-    Uses a running Wilder smooth so results are consistent with calc_rsi().
-    """
+    """Calculate RSI for each point in the series (returns aligned to prices)."""
     if len(prices) < period + 1:
         return []
-    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    result: list = [None] * (period + 1)  # RSI undefined for first period+1 bars
-
-    # Seed with SMA of first `period` deltas
-    avg_gain = sum(max(d, 0) for d in deltas[:period]) / period
-    avg_loss = sum(max(-d, 0) for d in deltas[:period]) / period
-
-    # First computable RSI
-    if avg_loss == 0:
-        result.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        result.append(100 - (100 / (1 + rs)))
-
-    # Wilder's smoothing for subsequent bars
-    for d in deltas[period:]:
-        avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
-        avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
-        if avg_loss == 0:
-            result.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            result.append(100 - (100 / (1 + rs)))
-
+    result = [None] * (period + 1)
+    for i in range(period + 1, len(prices) + 1):
+        r = calc_rsi(prices[:i], period)
+        result.append(r)
     return result
 
 
@@ -82,9 +57,9 @@ class RsiDivergence:
     def __init__(self, kraken: KrakenClient, risk: RiskManager):
         self.kraken = kraken
         self.risk = risk
-        self._cooldown_minutes = 240  # 4h cooldown between entries
+        self._cooldown_minutes = 120  # 2h cooldown between entries
         self._last_entry_time = None
-        self._lookback_swings = 20  # how far back to look for divergence
+        self._lookback_swings = 15  # how far back to look for divergence
 
     def evaluate(self, current_price: float) -> list:
         actions = []
@@ -107,7 +82,6 @@ class RsiDivergence:
                 logger.info("RSI divergence position %s held 7 days — closing", pos["id"])
                 result = self.risk.close_position(pos["id"], current_price)
                 if result:
-                    log_trade_to_md(result)
                     actions.append(result)
 
         has_open = any(p["status"] == "open" and p["strategy"] == "rsi_divergence"
@@ -125,8 +99,8 @@ class RsiDivergence:
             rsi_vals = [None] * (len(closes) - len(rsi_vals)) + rsi_vals
 
         # Find swing points
-        swing_lows = find_swing_lows(closes, window=3)
-        swing_highs = find_swing_highs(closes, window=3)
+        swing_lows = find_swing_lows(closes, window=2)
+        swing_highs = find_swing_highs(closes, window=2)
 
         # ── Bullish divergence (long signal) ─────────────────────────────
         # Price: lower low, RSI: higher low
@@ -141,7 +115,7 @@ class RsiDivergence:
                 price_lower_low = closes[curr_low_idx] < closes[prev_low_idx]
                 rsi_higher_low = curr_rsi > prev_rsi
 
-                if price_lower_low and rsi_higher_low and curr_rsi < 40:
+                if price_lower_low and rsi_higher_low and curr_rsi < rsi_div_long_threshold() + 5:
                     logger.info("BULLISH DIVERGENCE: price LL (%.2f < %.2f), RSI HL (%.1f > %.1f)",
                                 closes[curr_low_idx], closes[prev_low_idx], curr_rsi, prev_rsi)
                     action = self._open_position("buy", current_price, curr_rsi)
@@ -161,7 +135,7 @@ class RsiDivergence:
                 price_higher_high = closes[curr_high_idx] > closes[prev_high_idx]
                 rsi_lower_high = curr_rsi < prev_rsi
 
-                if price_higher_high and rsi_lower_high and curr_rsi > 60:
+                if price_higher_high and rsi_lower_high and curr_rsi > rsi_div_short_threshold() - 5:
                     logger.info("BEARISH DIVERGENCE: price HH (%.2f > %.2f), RSI LH (%.1f < %.1f)",
                                 closes[curr_high_idx], closes[prev_high_idx], curr_rsi, prev_rsi)
                     action = self._open_position("sell", current_price, curr_rsi)
@@ -171,19 +145,20 @@ class RsiDivergence:
         return actions
 
     def _open_position(self, side: str, price: float, rsi: float) -> Optional[dict]:
-        can_open, reason = self.risk.can_open_position(price)
+        can_open, reason = self.risk.can_open_position(price, side=side, strategy="rsi_divergence")
         if not can_open:
             logger.info("RSI divergence %s blocked: %s", side, reason)
             return None
 
         size_btc = self.risk.position_size_btc(price)
-        # 1.5 risk-reward per backtests
+        sl_pct = rsi_div_sl()
+        tp_pct = rsi_div_tp()
         if side == "buy":
-            stop_loss = price * (1 - 2.0 / 100)
-            take_profit = price * (1 + 3.0 / 100)  # 1:1.5 R:R
+            stop_loss = price * (1 - sl_pct / 100)
+            take_profit = price * (1 + tp_pct / 100)
         else:
-            stop_loss = price * (1 + 2.0 / 100)
-            take_profit = price * (1 - 3.0 / 100)
+            stop_loss = price * (1 + sl_pct / 100)
+            take_profit = price * (1 - tp_pct / 100)
 
         pos = self.risk.open_position(
             side=side,
@@ -193,7 +168,6 @@ class RsiDivergence:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         self._last_entry_time = datetime.utcnow()
         logger.info("RSI Divergence %s: price=$%.2f, RSI=%.1f", side.upper(), price, rsi)
         return pos

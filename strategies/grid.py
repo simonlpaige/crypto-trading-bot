@@ -11,8 +11,6 @@ from typing import Optional, List
 import config
 from utils.risk_manager import RiskManager
 from utils.kraken_client import KrakenClient
-from utils.logger import log_trade_to_md
-
 logger = logging.getLogger("cryptobot.grid")
 
 
@@ -55,9 +53,9 @@ class GridBot:
 
         actions = []
 
-        # Check buy levels (price dropped to a grid level)
+        # Check buy levels (price dropped to a grid level below current price)
         for level in self.grid_levels:
-            if level >= current_price and level < self.reference_price:
+            if level <= current_price and level < self.reference_price:
                 level_key = f"buy-{level}"
                 if level_key not in self.filled_buys:
                     action = self._try_grid_buy(current_price, level)
@@ -65,8 +63,8 @@ class GridBot:
                         self.filled_buys.add(level_key)
                         actions.append(action)
 
-            # Check sell levels (price rose to a grid level)
-            elif level <= current_price and level > self.reference_price:
+            # Check sell levels (price rose to a grid level above current price)
+            elif level >= current_price and level > self.reference_price:
                 level_key = f"sell-{level}"
                 if level_key not in self.filled_sells:
                     action = self._try_grid_sell(current_price, level)
@@ -76,6 +74,11 @@ class GridBot:
 
         return actions
 
+    def _count_open_grid_positions(self) -> int:
+        """Count currently open grid positions."""
+        return sum(1 for p in self.risk.positions
+                   if p["status"] == "open" and p["strategy"] == "grid")
+
     def _try_grid_buy(self, price: float, level: float) -> Optional[dict]:
         """Attempt a grid buy. Also closes any open grid shorts at profit."""
         # Close any profitable grid shorts first
@@ -84,10 +87,15 @@ class GridBot:
                 if price <= pos["take_profit"]:
                     result = self.risk.close_position(pos["id"], price)
                     if result:
-                        log_trade_to_md(result)
                         logger.info("Grid short covered at $%.2f, P&L=$%.2f", price, result["pnl"])
 
-        can_open, reason = self.risk.can_open_position(price)
+        # Respect max grid positions to leave room for other strategies
+        max_grid = getattr(config, "MAX_GRID_POSITIONS", 2)
+        if self._count_open_grid_positions() >= max_grid:
+            logger.debug("Grid buy blocked: %d/%d grid positions open", self._count_open_grid_positions(), max_grid)
+            return None
+
+        can_open, reason = self.risk.can_open_position(price, side="buy", strategy="grid")
         if not can_open:
             logger.info("Grid buy blocked at $%.2f: %s", price, reason)
             return None
@@ -106,7 +114,6 @@ class GridBot:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         return pos
 
     def _try_grid_sell(self, price: float, level: float) -> Optional[dict]:
@@ -117,7 +124,6 @@ class GridBot:
                 if price >= pos["take_profit"]:
                     result = self.risk.close_position(pos["id"], price)
                     if result:
-                        log_trade_to_md(result)
                         closed.append(result)
 
         # Also open a short at upper grid levels
@@ -136,7 +142,13 @@ class GridBot:
         if open_shorts:
             return None
 
-        can_open, reason = self.risk.can_open_position(price)
+        # Respect max grid positions to leave room for other strategies
+        max_grid = getattr(config, "MAX_GRID_POSITIONS", 2)
+        if self._count_open_grid_positions() >= max_grid:
+            logger.debug("Grid short blocked: %d/%d grid positions open", self._count_open_grid_positions(), max_grid)
+            return None
+
+        can_open, reason = self.risk.can_open_position(price, side="sell", strategy="grid")
         if not can_open:
             logger.info("Grid short blocked at $%.2f: %s", price, reason)
             return None
@@ -155,14 +167,15 @@ class GridBot:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         logger.info("Grid SHORT: price=$%.2f, level=$%.2f, size=%.6f BTC",
                      price, level, size_btc)
         return pos
 
     def should_reinitialize(self, current_price: float) -> bool:
-        """Re-center grid if price moved >15% from reference."""
+        """Re-center grid if price moved >25% from reference.
+        Raised from 15% to prevent excessive grid resets in volatile markets.
+        """
         if not self.reference_price:
             return True
         pct_move = abs(current_price - self.reference_price) / self.reference_price * 100
-        return pct_move > 15
+        return pct_move > 25

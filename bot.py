@@ -19,19 +19,30 @@ Usage:
 import sys
 import os
 import time
-
-# Load .env file if present
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed, rely on shell environment
 import logging
 import signal
 from datetime import datetime, timezone
 
 # Ensure project root is on path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_bot_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _bot_dir)
+
+# Load .env file if present (for API keys)
+_env_file = os.path.join(_bot_dir, ".env")
+if os.path.exists(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# Handle --backtest before importing config (which requires API keys)
+if "--backtest" in sys.argv:
+    if not os.environ.get("KRAKEN_API_KEY"):
+        os.environ["KRAKEN_API_KEY"] = "backtest-dummy"
+    if not os.environ.get("KRAKEN_PRIVATE_KEY"):
+        os.environ["KRAKEN_PRIVATE_KEY"] = "backtest-dummy"
 
 import config
 from utils.logger import setup_logging, log_daily_summary
@@ -42,6 +53,9 @@ from strategies.sentiment import SentimentSwing
 from strategies.ema_macd import EmaMacdMomentum
 from strategies.bollinger import BollingerMeanReversion
 from strategies.rsi_divergence import RsiDivergence
+from strategies.political import PoliticalSignals
+from strategies.novel import TariffWhiplashStrategy, CongressionalFrontRunStrategy
+from strategies.regime import RegimeDetector
 from trainer.engine import run_cycle, load_training_state, save_training_state
 from manager.health import full_health_check, format_health_report
 from manager.researcher import run_full_research, format_research_report
@@ -73,11 +87,21 @@ def main():
     # Initialize components
     kraken = KrakenClient()
     risk = RiskManager()
+    regime_detector = RegimeDetector(kraken)
     grid = GridBot(kraken, risk)
     sentiment = SentimentSwing(kraken, risk)
-    ema_macd = EmaMacdMomentum(kraken, risk)
-    bollinger = BollingerMeanReversion(kraken, risk)
-    rsi_div = RsiDivergence(kraken, risk)
+    ema_macd = EmaMacdMomentum(kraken, risk) if getattr(config, "ENABLE_EMA_MACD", True) else None
+    bollinger = BollingerMeanReversion(kraken, risk) if getattr(config, "ENABLE_BOLLINGER", True) else None
+    rsi_div = RsiDivergence(kraken, risk) if getattr(config, "ENABLE_RSI_DIVERGENCE", True) else None
+    political = PoliticalSignals(kraken, risk)
+    tariff_whiplash = TariffWhiplashStrategy(kraken, risk) if getattr(config, "ENABLE_TARIFF_WHIPLASH", True) else None
+    congress_frontrun = CongressionalFrontRunStrategy(kraken, risk) if getattr(config, "ENABLE_CONGRESS_FRONTRUN", True) else None
+
+    enabled = [s for s, v in [("Grid", True), ("Sentiment", True),
+               ("EMA/MACD", ema_macd), ("Bollinger", bollinger),
+               ("RSI Div", rsi_div), ("Political", True),
+               ("TariffWhiplash", tariff_whiplash), ("CongressFrontrun", congress_frontrun)] if v]
+    logger.info("Active strategies: %s", ", ".join(enabled))
 
     # Track daily summary
     last_summary_date = None
@@ -110,27 +134,53 @@ def main():
 
             # ── Check existing positions for SL/TP ───────────────────────
             closed = risk.check_stop_loss_take_profit(price)
-            for pos in closed:
-                from utils.logger import log_trade_to_md
-                log_trade_to_md(pos)
 
-            # ── Run strategies ───────────────────────────────────────────
+            # ── Detect market regime ─────────────────────────────────────
+            try:
+                regime = regime_detector.update()
+            except Exception as re_err:
+                logger.warning("Regime detection failed (defaulting to neutral): %s", re_err)
+                regime = "neutral"
+
+            # ── Run strategies (filtered by regime) ─────────────────────
             if not risk.is_paused:
                 # Grid bot: reinitialize if price moved too far
                 if grid.should_reinitialize(price):
                     grid.initialize(price)
 
-                grid_actions = grid.evaluate(price)
-                sentiment_actions = sentiment.evaluate(price)
-                ema_actions = ema_macd.evaluate(price)
-                boll_actions = bollinger.evaluate(price)
-                rsi_actions = rsi_div.evaluate(price)
+                # Regime-based strategy selection:
+                #   trending (ADX>25): momentum only (sentiment, rsi_divergence, congress_frontrun)
+                #   ranging  (ADX<20): grid only
+                #   neutral  (20-25):  all strategies
+                grid_actions = []
+                sentiment_actions = []
+                ema_actions = []
+                boll_actions = []
+                rsi_actions = []
+                political_actions = []
+                whiplash_actions = []
+                frontrun_actions = []
+
+                if regime in ("ranging", "neutral"):
+                    grid_actions = grid.evaluate(price)
+                if regime in ("trending", "neutral"):
+                    sentiment_actions = sentiment.evaluate(price)
+                    rsi_actions = rsi_div.evaluate(price) if rsi_div else []
+                    frontrun_actions = congress_frontrun.evaluate(price) if congress_frontrun else []
+                if regime == "neutral":
+                    # These only run in neutral — disabled strategies still gated by config
+                    ema_actions = ema_macd.evaluate(price) if ema_macd else []
+                    boll_actions = bollinger.evaluate(price) if bollinger else []
+                    political_actions = political.evaluate(price)
+                    whiplash_actions = tariff_whiplash.evaluate(price) if tariff_whiplash else []
 
                 for name, acts in [("Grid", grid_actions), ("Sentiment", sentiment_actions),
                                    ("EMA/MACD", ema_actions), ("Bollinger", boll_actions),
-                                   ("RSI Div", rsi_actions)]:
+                                   ("RSI Div", rsi_actions), ("Political", political_actions),
+                                   ("TariffWhiplash", whiplash_actions),
+                                   ("CongressFrontrun", frontrun_actions)]:
                     if acts:
-                        logger.info("%s: %d actions this tick", name, len(acts))
+                        logger.info("%s: %d actions this tick [regime=%s]", name, len(acts), regime)
             else:
                 logger.warning("Trading PAUSED: %s", risk.pause_reason)
 
@@ -182,9 +232,9 @@ def main():
             # ── Daily summary ────────────────────────────────────────────
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if last_summary_date != today and datetime.now(timezone.utc).hour >= 23:
+                last_summary_date = today  # set immediately to prevent re-trigger
                 summary = risk.get_daily_summary()
                 log_daily_summary(summary)
-                last_summary_date = today
                 logger.info("Daily summary: P&L=$%+.2f | Balance=$%.2f | Win rate=%.0f%%",
                             summary["daily_pnl"], summary["balance"], summary["win_rate"])
 
@@ -211,4 +261,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--backtest" in sys.argv:
+        from trainer.backtester import run_backtest
+        run_backtest()
+    else:
+        main()

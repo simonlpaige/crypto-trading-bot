@@ -666,6 +666,53 @@ def propose_strategy(pattern: dict) -> Optional[dict]:
         return None
 
 
+# ── Proposal Validation & Promotion ───────────────────────────────────────
+
+def validate_proposals(min_confidence: str = "medium", max_promote: int = 2) -> list:
+    """Validate and promote high-confidence proposals from 'proposed' to 'testing'.
+
+    Criteria for promotion:
+    - confidence >= min_confidence ('medium' or 'high')
+    - sample_size >= 10
+    - expected_win_rate >= 0.65
+
+    Returns list of promoted proposal names.
+    """
+    try:
+        proposals_data = _load_json(PROPOSALS_FILE, {"proposals": []})
+        proposals = proposals_data.get("proposals", [])
+
+        confidence_rank = {"low": 0, "medium": 1, "high": 2}
+        min_rank = confidence_rank.get(min_confidence, 1)
+
+        promoted = []
+        for p in proposals:
+            if p.get("status") != "proposed":
+                continue
+            if len(promoted) >= max_promote:
+                break
+
+            conf_rank = confidence_rank.get(p.get("confidence", "low"), 0)
+            if (conf_rank >= min_rank
+                    and p.get("sample_size", 0) >= 10
+                    and p.get("expected_win_rate", 0) >= 0.65):
+                p["status"] = "testing"
+                p["promoted_at"] = _now_iso()
+                promoted.append(p["name"])
+                logger.info("PROMOTED proposal '%s' to testing (WR=%.0f%%, n=%d, conf=%s)",
+                            p["name"], p["expected_win_rate"] * 100,
+                            p["sample_size"], p["confidence"])
+
+        if promoted:
+            proposals_data["last_updated"] = _now_iso()
+            _save_json(PROPOSALS_FILE, proposals_data)
+
+        return promoted
+    except Exception as e:
+        logger.error("validate_proposals failed: %s", e)
+        return []
+
+
 # ── Discovery Summary ──────────────────────────────────────────────────────
 
 def get_discovery_summary() -> dict:

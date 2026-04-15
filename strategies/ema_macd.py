@@ -13,8 +13,7 @@ from datetime import datetime, timedelta
 import config
 from utils.risk_manager import RiskManager
 from utils.kraken_client import KrakenClient
-from utils.logger import log_trade_to_md
-
+from trainer.param_loader import ema_adx_threshold, ema_rsi_long_range, ema_rsi_short_range, ema_sl, ema_tp
 logger = logging.getLogger("cryptobot.ema_macd")
 
 
@@ -30,32 +29,15 @@ def ema(prices: list, period: int) -> list:
 
 
 def calc_rsi(prices: list, period: int = 14) -> Optional[float]:
-    """Calculate RSI using Wilder's smoothed moving average (SMMA).
-
-    This matches the standard RSI shown on TradingView, Binance, and most
-    charting platforms. The first average is a simple mean (SMA seed),
-    then subsequent values use exponential smoothing:
-        avg = (prev_avg * (period - 1) + current_value) / period
-
-    See: https://www.investopedia.com/terms/r/rsi.asp
-    """
+    """Calculate RSI from closing prices."""
     if len(prices) < period + 1:
         return None
     deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-
-    # Seed with SMA of first `period` deltas
-    first_gains = [max(d, 0) for d in deltas[:period]]
-    first_losses = [max(-d, 0) for d in deltas[:period]]
-    avg_gain = sum(first_gains) / period
-    avg_loss = sum(first_losses) / period
-
-    # Wilder's smoothing for the remaining deltas
-    for d in deltas[period:]:
-        avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
-        avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
-
-    if avg_loss == 0:
-        return 100.0  # no losses → RSI maxes out
+    recent = deltas[-period:]
+    gains = [d for d in recent if d > 0]
+    losses = [-d for d in recent if d < 0]
+    avg_gain = sum(gains) / period if gains else 0.001
+    avg_loss = sum(losses) / period if losses else 0.001
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -110,7 +92,7 @@ class EmaMacdMomentum:
         self.risk = risk
         self._last_signal = None  # "long" or "short" or None
         self._signal_time = None
-        self._cooldown_minutes = 60  # don't re-enter same direction within 1h
+        self._cooldown_minutes = 30  # don't re-enter same direction within 30min
 
     def evaluate(self, current_price: float) -> list:
         """Evaluate EMA/MACD signals. Returns list of actions."""
@@ -132,19 +114,16 @@ class EmaMacdMomentum:
         if not ema12 or not ema26:
             return actions
 
-        # Align EMAs — ema26 produces fewer values than ema12 because it
-        # needs 26 bars of seed data vs 12. Trim ema12 to match ema26 length.
+        # Align EMAs (ema26 starts later)
         offset = len(ema12) - len(ema26)
         ema12_aligned = ema12[offset:]
 
-        # MACD = EMA12 - EMA26; Signal = 9-period EMA of MACD line
-        # Histogram = MACD - Signal (positive = bullish momentum)
+        # MACD line and histogram
         macd_line = [e12 - e26 for e12, e26 in zip(ema12_aligned, ema26)]
         signal_line = ema(macd_line, 9) if len(macd_line) >= 9 else []
         if not signal_line:
             return actions
 
-        # Align MACD and signal line (signal starts later due to 9-bar EMA)
         sl_offset = len(macd_line) - len(signal_line)
         macd_hist = [m - s for m, s in zip(macd_line[sl_offset:], signal_line)]
 
@@ -157,9 +136,10 @@ class EmaMacdMomentum:
         rsi = calc_rsi(closes)
         adx = calc_adx(highs, lows, closes)
 
-        # ADX filter — only trade trending markets
-        if adx is not None and adx < 25:
-            logger.debug("ADX=%.1f < 25, skipping EMA/MACD (ranging market)", adx)
+        # ADX filter — only trade trending markets (tunable via trainer)
+        adx_thresh = ema_adx_threshold()
+        if adx is not None and adx < adx_thresh:
+            logger.debug("ADX=%.1f < %.0f, skipping EMA/MACD (ranging market)", adx, adx_thresh)
             return actions
 
         # Check cooldown
@@ -178,51 +158,62 @@ class EmaMacdMomentum:
                     logger.info("EMA/MACD histogram flipped negative — closing long")
                     result = self.risk.close_position(pos["id"], current_price)
                     if result:
-                        log_trade_to_md(result)
                         actions.append(result)
                 # Exit short if MACD histogram turns positive
                 elif pos["side"] == "sell" and curr_hist > 0 and prev_hist <= 0:
                     logger.info("EMA/MACD histogram flipped positive — closing short")
                     result = self.risk.close_position(pos["id"], current_price)
                     if result:
-                        log_trade_to_md(result)
                         actions.append(result)
             return actions
 
-        # ── Entry signals ────────────────────────────────────────────────
-        # LONG: histogram positive and increasing, RSI 40-70
-        if curr_hist > 0 and curr_hist > prev_hist:
-            if rsi and 40 <= rsi <= 70:
-                action = self._open_position("buy", current_price, rsi, adx)
-                if action:
-                    actions.append(action)
-                    self._last_signal = "long"
-                    self._signal_time = datetime.utcnow()
+        # ── Trend filter: 50-period SMA ─────────────────────────────────
+        sma50 = sum(closes[-50:]) / min(len(closes), 50) if len(closes) >= 50 else None
 
-        # SHORT: histogram negative and decreasing, RSI 30-60
+        # ── Entry signals ────────────────────────────────────────────────
+        # LONG: histogram positive and increasing, RSI in tunable range, price > SMA50
+        rsi_long_lo, rsi_long_hi = ema_rsi_long_range()
+        rsi_short_lo, rsi_short_hi = ema_rsi_short_range()
+        if curr_hist > 0 and curr_hist > prev_hist:
+            if rsi and rsi_long_lo <= rsi <= rsi_long_hi:
+                if sma50 is None or current_price > sma50:
+                    action = self._open_position("buy", current_price, rsi, adx)
+                    if action:
+                        actions.append(action)
+                        self._last_signal = "long"
+                        self._signal_time = datetime.utcnow()
+                else:
+                    logger.debug("EMA/MACD long blocked: price $%.2f < SMA50 $%.2f", current_price, sma50)
+
+        # SHORT: histogram negative and decreasing, RSI in tunable range, price < SMA50
         elif curr_hist < 0 and curr_hist < prev_hist:
-            if rsi and 30 <= rsi <= 60:
-                action = self._open_position("sell", current_price, rsi, adx)
-                if action:
-                    actions.append(action)
-                    self._last_signal = "short"
-                    self._signal_time = datetime.utcnow()
+            if rsi and rsi_short_lo <= rsi <= rsi_short_hi:
+                if sma50 is None or current_price < sma50:
+                    action = self._open_position("sell", current_price, rsi, adx)
+                    if action:
+                        actions.append(action)
+                        self._last_signal = "short"
+                        self._signal_time = datetime.utcnow()
+                else:
+                    logger.debug("EMA/MACD short blocked: price $%.2f > SMA50 $%.2f", current_price, sma50)
 
         return actions
 
     def _open_position(self, side: str, price: float, rsi: float, adx: Optional[float]) -> Optional[dict]:
-        can_open, reason = self.risk.can_open_position(price)
+        can_open, reason = self.risk.can_open_position(price, side=side, strategy="ema_macd")
         if not can_open:
             logger.info("EMA/MACD %s blocked: %s", side, reason)
             return None
 
         size_btc = self.risk.position_size_btc(price)
+        sl_pct = ema_sl()
+        tp_pct = ema_tp()
         if side == "buy":
-            stop_loss = price * (1 - 1.8 / 100)  # 1.8% SL (1.5x ATR approximation)
-            take_profit = price * (1 + 3.2 / 100)  # 3.2% target
+            stop_loss = price * (1 - sl_pct / 100)
+            take_profit = price * (1 + tp_pct / 100)
         else:
-            stop_loss = price * (1 + 1.8 / 100)
-            take_profit = price * (1 - 3.2 / 100)
+            stop_loss = price * (1 + sl_pct / 100)
+            take_profit = price * (1 - tp_pct / 100)
 
         pos = self.risk.open_position(
             side=side,
@@ -232,7 +223,6 @@ class EmaMacdMomentum:
             stop_loss=stop_loss,
             take_profit=take_profit,
         )
-        log_trade_to_md(pos)
         logger.info("EMA/MACD %s: price=$%.2f, RSI=%.1f, ADX=%s",
                      side.upper(), price, rsi, f"{adx:.1f}" if adx else "N/A")
         return pos
